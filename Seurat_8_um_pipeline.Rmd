@@ -1,0 +1,486 @@
+---
+title: "Seurat pipeline 8 um data analysis"
+author: "github.com/acerch"
+date: "2025-05-06"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,  collapse = FALSE)
+```
+
+## Seurat pipeline
+
+Following Seurat "Analysis, visualization, and integration of Visium HD spatial datasets with Seurat" tutorial, available in: <https://satijalab.org/seurat/articles/visiumhd_analysis_vignette>.
+
+And the "Visium HD Analysis" from [Harvard Chan Bioinformatics Core (HBC)](http://bioinformatics.sph.harvard.edu/). Available in: <https://github.com/hbctraining/spatial_nanocourse/blob/main/lessons/visium_hd.md>
+
+Data used available in the 10X Genomics Data Base in: <https://www.10xgenomics.com/datasets/visium-hd-cytassist-gene-expression-human-breast-cancer-fresh-frozen>
+
+```{r Load libraries, results='hide'}
+# Necessary packages CRAN 
+list.of.packages = c("Seurat","ggplot2", "dplyr", "patchwork","hdf5r","arrow","ape", "remotes", "devtools", "tictoc")
+
+# Install necessary packages if needed
+new.packages = list.of.packages[!(list.of.packages %in% installed.packages())]
+if(length(new.packages)> 0) install.packages(new.packages)
+
+# Load CRAN packages 
+invisible(lapply(list.of.packages, FUN=library, character.only=TRUE))
+
+# Verify if Seurat packages are installed
+if (!requireNamespace("SeuratDisk", quietly = TRUE)) {
+  remotes::install_github("mojaveazure/seurat-disk")
+}
+
+if (!requireNamespace("SeuratData", quietly = TRUE)) {
+  remotes::install_github("satijalab/seurat-data")
+}
+
+# Load Seurat packages
+invisible(lapply(c("SeuratDisk", "SeuratData"), FUN=library, character.only=TRUE))
+
+# Bioconductor packages 
+bioconductor.packages = c("GO.db", "org.Hs.eg.db", "limma")
+
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager", repos = "https://cloud.r-project.org")
+}
+library(BiocManager)
+
+new.packages.bio = bioconductor.packages[!(bioconductor.packages %in% installed.packages())]
+if(length(new.packages.bio)> 0) BiocManager::install(new.packages.bio)
+
+# Load Bioconductor packages 
+invisible(lapply(bioconductor.packages, FUN=library, character.only=TRUE))
+```
+
+```{r Time}
+# Measure run time notebook 
+tic("Total time Seurat pipeline")
+```
+
+```{r Load data}
+# Load Visium HD data 
+localdir <- "../../Data/Raw/raw_data_fresh_frozen/"
+list.files(localdir)
+# Load a 10x Genomics 8 um Visium Spatial Experiment into a Seurat object
+object <- Load10X_Spatial(data.dir = localdir, bin.size = 8)
+object
+```
+
+```{r Quality COntrol Pre-Filtering}
+# Quality Control
+# Pre-filterning 
+# Create a metadata object
+object_meta <- object@meta.data
+
+# Plot the number of UMIs (nUMI) and the number of genes (nGene)
+# Create a plot for nUMI
+dist_counts_before <- object_meta %>%
+  ggplot(aes(x=nCount_Spatial.008um)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  ylab("Cell density") +
+  xlab("Number of UMIs per bin") +
+  ggtitle('Pre-QC UMIs/Bin') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Create a plot for nGene
+dist_features_before <- object_meta %>%
+  ggplot(aes(x=nFeature_Spatial.008um)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  ylab("Cell density") +
+  xlab("Number of genes per bin") +
+  ggtitle('Pre-QC Genes/Bin') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+dists_before <- dist_counts_before | dist_features_before
+dists_before
+
+# Good quality data, just one pick representing healthy cells with high number of genes and UMIs per bin.
+```
+
+```{r Filtering, warning=FALSE}
+# Apply filter to delete low quality bins and genes
+print(paste("The numer of initial bins and genes before filtering was:",  nrow(object@meta.data), "and",nrow(object), "respectively." ))
+
+# Create a filtered object, with with nUMI > 80 and nGene > 80, leaving the higher quality bins
+object_filt <- subset(object, (nCount_Spatial.008um > 80) & 
+                        (nFeature_Spatial.008um > 80))
+
+
+# Calculate the % of mitocondrial genes per bin 
+object_filt[["percent.mt"]] <- PercentageFeatureSet(object_filt, pattern = "^MT-")
+
+# Apply filter keeping bins of < 30% mitocondrial genes
+object_filt <- subset(object_filt, subset = percent.mt < 30)
+
+# Obtain the count matrix
+counts = GetAssayData(object_filt,layer = "counts")
+# Filter genes that appear in at least 5 bins, high quality genes
+hq_genes = rowSums(counts >0) >= 5
+# Subset seurat object to keep only high quality genes
+object_filt = subset(object_filt, features = names(hq_genes[hq_genes]))
+print(paste("Resulting in" , nrow(object_filt@meta.data), "bins and",nrow(object_filt) , "genes after filtering for further processing."))
+```
+
+```{r problema2}
+# Calculate statistics of filtered object
+summary(object_filt$nCount_Spatial.008um, na.rm = T)
+summary(object_filt$nFeature_Spatial.008um, na.rm = T)
+```
+
+```{r problema}
+# Create a new metadata data frame with the filtered object
+object_filt_meta <- object_filt@meta.data
+
+# Plot nUMI
+dist_counts_after <- object_filt_meta %>%
+  ggplot(aes(x=nCount_Spatial.008um)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  ylab("Cell density") +
+  xlab("Number of UMIs per bin") +
+  ggtitle('PostQC UMIs/Bin') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Plot nGene
+dist_features_after <- object_filt_meta %>%
+  ggplot(aes(x=nFeature_Spatial.008um)) +
+  geom_density(alpha = 0.2) +
+  scale_x_log10() +
+  theme_classic() +
+  ylab("Cell density") +
+  xlab("Number of genes per bin") +
+  ggtitle('PostQC Genes/Bin') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Combine plots side-by-side
+dists_after <- dist_counts_after | dist_features_after
+dists_after
+```
+
+```{r}
+# Visualizing Counts Data
+# Visualize the number of UMIs and gene counts per bin as a distribution 
+# Violin plot of UMI counts
+vln_counts_after <- VlnPlot(object_filt, 
+                            features = "nCount_Spatial.008um", 
+                            pt.size = 0, 
+                            group.by = 'orig.ident') + 
+  NoLegend()  + scale_y_log10() + ggtitle('nUMI') + xlab('FF_breast') + ylim(c(80, 6000))
+
+# Violin plot of gene counts
+vln_features_after <- VlnPlot(object_filt, 
+                            features = "nFeature_Spatial.008um", 
+                            pt.size = 0, 
+                            group.by = 'orig.ident') + 
+  NoLegend() + scale_y_log10() + ggtitle('nGene') +  xlab('FF_breast') + ylim(c(80, 6000))
+
+
+# Plot both side by side
+vln_counts_after | vln_features_after
+
+```
+
+```{r}
+# Visualizing UMI count across the tissue image
+image_counts <- SpatialFeaturePlot(object_filt, 
+                                   feature = 'nCount_Spatial.008um', 
+                                   pt.size.factor = 8) + 
+  theme(legend.position = "top", 
+        legend.title = element_text(size = 10, hjust = 0, vjust = 1), 
+        legend.text = element_text(size = 6.5))
+
+        
+# Visualizing gene count across the image
+image_features <- SpatialFeaturePlot(object_filt, 
+                                     features = "nFeature_Spatial.008um", 
+                                     pt.size.factor = 8) +
+  theme(legend.position = "top", 
+        legend.title = element_text(size = 10, hjust = 0, vjust = 1))
+
+
+# Plot the two side-by-side
+image_counts | image_features
+
+# note that many spots have very few counts, in-part
+# due to low cellular density in certain tissue regions
+```
+
+```{r}
+# Normalize dataset, use standard log-normalization for spatial data
+object_filt <- NormalizeData(object_filt, assay = 'Spatial.008um')
+object_filt
+```
+
+```{r, echo=FALSE, results='hide', message=FALSE}
+# Delete unecessary objects to free up memory 
+rm(object, object_meta, dist_counts_after, dist_counts_before, dist_features_after, dist_features_before, dists_after, dists_before, image_counts, image_features, vln_counts_after, vln_features_after, list.of.packages, new.packages, localdir, bioconductor.packages, new.packages.bio, counts, hq_genes)
+```
+
+```{r}
+# Unsupervised clustering
+# Define a set of highly variable genes, will help to quantify the variability and similarity between bins.
+object_filt <- FindVariableFeatures(object_filt)
+object_filt <- ScaleData(object_filt)
+# Select 50,0000 cells and create a new 'sketch' assay
+object_filt <- SketchData(
+  object = object_filt,
+  ncells = 50000,
+  method = "LeverageScore",
+  sketched.assay = "sketch", 
+  features = VariableFeatures(object_filt)
+)
+object_filt
+# Observe the leverage score has been added as a column to the metadata of our object.
+head(object_filt@meta.data)
+```
+
+```{r}
+# Perform clustering workflow
+object_filt <- FindVariableFeatures(object_filt)
+object_filt <- ScaleData(object_filt)
+object_filt <- RunPCA(object_filt, assay = "sketch", reduction.name = "pca.sketch")
+object_filt <- FindNeighbors(object_filt, assay = "sketch", reduction = "pca.sketch", dims = 1:50)
+# Find CLusters with Leiden algorith
+object_filt <- FindClusters(object_filt, cluster.name = "seurat_cluster.sketched", resolution = 0.65, algorithm = 4)
+# Create a UMAP using the principal components as input
+object_filt <- RunUMAP(object_filt, reduction = "pca.sketch", reduction.name = "umap.sketch", return.model = T, dims = 1:50)
+
+# Set color palette
+color_pal <- Seurat::DiscretePalette(n = length(unique(object_filt$seurat_cluster.sketched)),
+                                    palette = "polychrome")
+names(color_pal) <- sort(unique(object_filt$seurat_cluster.sketched))
+
+# Arrange so clusters get listed in numerical order
+object_filt$seurat_cluster.sketched <- object_filt$seurat_cluster.sketched %>% 
+  as.numeric %>% as.factor()
+
+Idents(object_filt) <- "seurat_cluster.sketched"
+
+# Plot UMAP
+DimPlot(object_filt, reduction = "umap.sketch", label = T, cols = color_pal) + 
+  ggtitle("Sketched clustering") + 
+  theme(legend.position = "none")
+```
+
+```{r}
+# Adjust MaxSize to run next step 
+options(future.globals.maxSize= 2000000000)
+
+# Project the cluster labels, and dimensional reductions (PCA and UMAP) that we learned from the 50,000 sketched cells
+object_filt <- ProjectData(
+  object = object_filt,
+  assay = "Spatial.008um",
+  full.reduction = "full.pca.sketch",
+  sketched.assay = "sketch",
+  sketched.reduction = "pca.sketch",
+  umap.model = "umap.sketch",
+  dims = 1:50,
+  refdata = list(seurat_cluster.projected = "seurat_cluster.sketched")
+)
+
+# Arrange so clusters get listed in numerical order
+object_filt$seurat_cluster.projected <- object_filt$seurat_cluster.projected %>% 
+  as.numeric %>% as.factor()
+
+object_filt
+head(object_filt@meta.data)
+```
+
+```{r}
+# Visualize the clustering results for the sketched cells, as well as the projected clustering results for the full dataset
+DefaultAssay(object_filt) <- "sketch"
+Idents(object_filt) <- "seurat_cluster.sketched"
+p1 <- DimPlot(object_filt, reduction = "umap.sketch", label = T, raster = F, cols = color_pal) + ggtitle("Sketched clustering (50,000 cells)") + theme(legend.position = "bottom")
+
+# switch to full dataset
+DefaultAssay(object_filt) <- "Spatial.008um"
+Idents(object_filt) <- "seurat_cluster.projected"
+p2 <- DimPlot(object_filt, reduction = "full.umap.sketch", label = T, raster = F, cols = color_pal) + ggtitle("Projected clustering (full dataset)") + theme(legend.position = "bottom")
+
+p_combinado <- p1 | p2
+p_combinado
+ggsave("p1.png", plot = p1, width = 8, height = 8, dpi = 300)
+ggsave("p2.png", plot = p2, width = 8, height = 8, dpi = 300)
+ggsave("p_combinado.png", plot = p_combinado, width = 12, height = 6, dpi = 300)
+```
+
+```{r}
+#  Visualize the unsupervised clusters based on their spatial location.
+image_seurat_clusters <- SpatialDimPlot(object_filt, 
+                                        group.by = 'seurat_cluster.projected', 
+                                        pt.size.factor = 6, cols = color_pal) +
+  guides(fill=guide_legend(ncol=2))
+
+image_seurat_clusters
+
+ggsave("clusters_image_0.65.png", plot = image_seurat_clusters, width = 8, height = 6, dpi = 300)
+```
+
+```{r}
+# Find and visualize the top gene expression markers for each cluster
+# Crete downsampled object to make visualization easier
+Idents(object_filt) <- "seurat_cluster.projected"
+object_subset <- subset(object_filt, cells = Cells(object_filt[["Spatial.008um"]]), downsample = 1000)
+
+# Order clusters by similarity
+DefaultAssay(object_subset) <- "Spatial.008um"
+Idents(object_subset) <- "seurat_cluster.projected"
+object_subset <- BuildClusterTree(object_subset, assay = "Spatial.008um", reduction = "full.pca.sketch", reorder = T)
+
+markers <- FindAllMarkers(object_subset, assay = "Spatial.008um", only.pos = TRUE)
+```
+
+```{r}
+# Add entrez column with entrez Ids of genes
+markers$entrez <- mapIds(org.Hs.eg.db,
+                         keys = markers$gene,
+                         column = "ENTREZID",
+                         keytype = "SYMBOL",
+                         multiVals = "first")
+
+# Select the 15 best ranked genes 
+markers %>%
+  group_by(cluster) %>%
+  dplyr::filter(avg_log2FC >= 1 , p_val_adj <= 0.05) %>%
+  slice_head(n = 15) %>%
+  ungroup() -> top15
+
+```
+
+```{r}
+# Manually annotating clusters using top 15 DEG from each cluster with CellMarkers BD, using tool CellMarker_annotation (http://www.bio-bigdata.center/CellMarker_annotation.jsp)
+```
+
+```{r}
+markers %>%
+  group_by(cluster) %>%
+  dplyr::filter(avg_log2FC >= 1 , p_val_adj <= 0.05) %>%
+  slice_head(n = 10) %>%
+  ungroup() -> top10
+
+object_subset <- ScaleData(object_subset, assay = "Spatial.008um", features = top10$gene)
+heatmap <- DoHeatmap(object_subset, assay = "Spatial.008um", features = top10$gene, size = 3, group.colors = color_pal) + theme(axis.text = element_text(size = 5.5), legend.position = "none")
+heatmap
+
+
+ggsave("heatmap.png", plot=heatmap, width=16, height=10, dpi =600)
+```
+
+```{r}
+# Build Tree only based on the top 10 genes per cluster 
+object_subset10 = BuildClusterTree(object_subset, features = top10$gene, reorder.numeric = T)
+
+# Plot dendogram
+data.tree <- Tool(object = object_subset10, slot = "BuildClusterTree")
+ape::plot.phylo(x = data.tree, direction = "rightwards", edge.width=0.5)
+```
+
+```{r}
+# Assign cell types to metadata
+clusters = object_filt@meta.data$seurat_cluster.projected
+
+levels(clusters)
+
+levels(clusters) = c("1.Célula madre hematopoyética/Pericito","2.Célula madre cancerosa","3.Mastocito/Célula plasmática", "4.Célula basal/Célula epitelial basal","5.Panmacrófago/Macrófago M1","6.Célula plasmática/Célula B","7.Miofibroblasto/Pericito","8.Célula progenitora epitelial/Célula B reguladora B10","9.Panmacrófago/Fibroblasto asoc. a cáncer","10.Célula progenitora epitelial/Fibroblasto asoc. a cáncer","11.Fibroblasto asoc. a cáncer/Célula epitelial luminal","12.Célula progenitora luminal")
+
+object_filt@meta.data$seurat_cluster.projected = clusters
+
+# Set color palette
+color_pal <- Seurat::DiscretePalette(n = length(unique(object_filt$seurat_cluster.projected)),
+                                    palette = "polychrome")
+names(color_pal) <- sort(unique(object_filt$seurat_cluster.projected))
+```
+
+```{r}
+# Review the levels
+levels(Idents(object_filt))
+head(object_filt@meta.data)
+levels(object_filt@meta.data$seurat_cluster.projected)
+```
+
+```{r}
+# Assign cell types to object
+levels(Idents(object_filt))
+# Create new cluster names with cell types
+new_cluster_names = c(
+  "1" = "1.Célula madre hematopoyética/Pericito",
+  "2" = "2.Célula madre cancerosa",
+  "3" = "3.Mastocito/Célula plasmática",
+  "4" = "4.Célula basal/Célula epitelial basal",
+  "5" = "5.Panmacrófago/Macrófago M1",
+  "6" = "6.Célula plasmática/Célula B",
+  "7" = "7.Miofibroblasto/Pericito",
+  "8" = "8.Célula progenitora epitelial/Célula B reguladora B10",
+  "9" = "9.Panmacrófago/Fibroblasto asoc. a cáncer",
+  "10" = "10.Célula progenitora epitelial/Fibroblasto asoc. a cáncer",
+  "11" = "11.Fibroblasto asoc. a cáncer/Célula epitelial luminal",
+  "12" = "12.Célula progenitora luminal"
+)
+
+# Assign cell types to clusters 
+names(new_cluster_names) = levels(object_filt)
+object_filt = RenameIdents(object_filt, new_cluster_names)
+levels(Idents(object_filt))
+
+# Plot UMAP
+umap_cells = DimPlot(object_filt, reduction = "full.umap.sketch", label = TRUE, raster=F, pt.size = 0.02, label.size = 0, cols = color_pal)
+umap_cells + coord_fixed(ratio = 1) +
+  ggtitle("Seurat 8 µm") +
+  xlab("UMAP1")+
+  ylab("UMAP2")+
+  theme(legend.text = element_text(size=8))
+```
+
+```{r}
+#  Visualize the unsupervised clusters based on their spatial location.
+image_seurat_clusters2 <- SpatialDimPlot(object_filt, 
+                                        group.by = 'seurat_cluster.projected', 
+                                        pt.size.factor = 6, cols = color_pal)
+
+image_seurat_clusters2  + ggtitle("Seurat 8 µm") +
+  theme(legend.title = element_blank(), legend.text = element_text(size=8))
+```
+
+```{r}
+# Prepare objects to perform GO
+
+# Define gene universe, all genes in markers
+universe_genes = unique(na.omit(markers$entrez))
+
+# Filter markers avg_log2FC > 1 and p_val_adj < 0.05
+filtered_markers = markers %>%
+  group_by(cluster) %>%
+  dplyr::filter(avg_log2FC >= 1, p_val_adj <= 0.05)
+
+```
+
+```{r}
+# Run goana for each cluster with top 15 markers 
+go_results_list15 = list()
+
+clusters15 = unique(top15$cluster)
+
+for (cl in clusters15) {
+  entrez_cl15 = top15 %>%
+    filter(cluster == cl) %>% 
+    pull(entrez)
+  
+  go_r15 = goana(entrez_cl15, universe = universe_genes, species = "Hs")
+  go_results_list15[[as.character(cl)]] = topGO(go_r15, number = 10, ontology = "BP")
+  print(names(go_results_list15[cl]))
+  print(go_results_list15[[cl]])
+}
+```
+
+```{r}
+# Report total run time Seurat pipeline 
+toc(quiet = FALSE)
+```
